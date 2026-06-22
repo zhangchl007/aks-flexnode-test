@@ -102,8 +102,8 @@ case "${CLUSTER_ALIAS}" in
     CONFIG_OUT="${ROOT_DIR}/config-B.json"
     ;;
   *)
-    if [[ "${COMMAND}" != "reset" && "${COMMAND}" != "network-fix" ]]; then
-      echo "Usage: $0 {join|gpu-stack|validate} {a|b} | $0 {reset|network-fix}" >&2
+    if [[ "${COMMAND}" != "reset" ]]; then
+      echo "Usage: $0 {join|gpu-stack|validate} {a|b} | $0 reset" >&2
       exit 1
     fi
     ;;
@@ -225,108 +225,6 @@ verify_gpu_operator_policy() {
     echo "GPU Operator driver.enabled must be false for AKSFlexNode preinstalled-driver hosts; got '${driver_enabled}'." >&2
     exit 2
   fi
-}
-
-prepare_flex_networking() {
-  if [[ "${FLEXNODE_REMAP_DOCKER_BRIDGE:-false}" != "true" ]]; then
-    return 0
-  fi
-
-  local docker_bridge_bip conflicting_local_cidr script
-  docker_bridge_bip="${FLEXNODE_DOCKER_BRIDGE_BIP:-172.31.0.1/16}"
-  conflicting_local_cidr="${FLEXNODE_CONFLICTING_LOCAL_CIDR:-172.17.0.0/16}"
-
-  script="$(cat <<EOF
-export CONFLICTING_LOCAL_CIDR='${conflicting_local_cidr}'
-export DOCKER_BRIDGE_BIP='${docker_bridge_bip}'
-EOF
-)"
-  script+=$'\n'
-  script+="$(cat <<'EOF'
-set -euo pipefail
-
-configure_docker_bridge() {
-  if ! command -v docker >/dev/null 2>&1 && ! systemctl list-unit-files docker.service >/dev/null 2>&1; then
-    return 0
-  fi
-
-  install -d -m 0755 /etc/docker
-  if [[ -s /etc/docker/daemon.json ]] && command -v jq >/dev/null 2>&1; then
-    tmp_file="$(mktemp)"
-    jq --arg bip "${DOCKER_BRIDGE_BIP}" '.bip = $bip' /etc/docker/daemon.json > "${tmp_file}"
-    install -m 0644 "${tmp_file}" /etc/docker/daemon.json
-    rm -f "${tmp_file}"
-  else
-    cp -f /etc/docker/daemon.json /etc/docker/daemon.json.bak 2>/dev/null || true
-    printf '{"bip":"%s"}\n' "${DOCKER_BRIDGE_BIP}" >/etc/docker/daemon.json
-  fi
-
-  systemctl restart docker 2>/dev/null || true
-}
-
-remove_conflicting_docker0() {
-  if ip -o route show "${CONFLICTING_LOCAL_CIDR}" 2>/dev/null | grep -qw docker0; then
-    ip link delete docker0 2>/dev/null || true
-  fi
-}
-
-configure_docker_bridge
-remove_conflicting_docker0
-
-if machinectl list --no-legend 2>/dev/null | awk '{print $1}' | grep -qx kube1; then
-  machinectl shell kube1 /bin/bash -lc "
-    set -euo pipefail
-    export CONFLICTING_LOCAL_CIDR='${CONFLICTING_LOCAL_CIDR}'
-    export DOCKER_BRIDGE_BIP='${DOCKER_BRIDGE_BIP}'
-    $(declare -f configure_docker_bridge)
-    $(declare -f remove_conflicting_docker0)
-    configure_docker_bridge
-    remove_conflicting_docker0
-  "
-fi
-
-if ip -o route show "${CONFLICTING_LOCAL_CIDR}" 2>/dev/null | grep -qw docker0; then
-  echo "Host still has ${CONFLICTING_LOCAL_CIDR} routed to docker0." >&2
-  exit 2
-fi
-EOF
-)"
-
-  run_gpu_host_root_script "${script}"
-}
-
-verify_flex_networking() {
-  if [[ "${FLEXNODE_REMAP_DOCKER_BRIDGE:-false}" != "true" ]]; then
-    return 0
-  fi
-
-  local docker_bridge_bip conflicting_local_cidr script
-  docker_bridge_bip="${FLEXNODE_DOCKER_BRIDGE_BIP:-172.31.0.1/16}"
-  conflicting_local_cidr="${FLEXNODE_CONFLICTING_LOCAL_CIDR:-172.17.0.0/16}"
-
-  script="$(cat <<EOF
-export CONFLICTING_LOCAL_CIDR='${conflicting_local_cidr}'
-export DOCKER_BRIDGE_BIP='${docker_bridge_bip}'
-EOF
-)"
-  script+=$'\n'
-  script+="$(cat <<'EOF'
-set -euo pipefail
-
-if machinectl list --no-legend 2>/dev/null | awk '{print $1}' | grep -qx kube1; then
-  machinectl shell kube1 /bin/bash -lc "
-    set -euo pipefail
-    if ip -o route show '${CONFLICTING_LOCAL_CIDR}' 2>/dev/null | grep -qw docker0; then
-      echo 'kube1 still has ${CONFLICTING_LOCAL_CIDR} routed to docker0.' >&2
-      exit 2
-    fi
-    ip route get 172.17.0.1 || true
-  "
-fi
-EOF
-)"
-
-  run_gpu_host_root_script "${script}"
 }
 
 generate_bootstrap_mi_config() {
@@ -528,7 +426,6 @@ case "${COMMAND}" in
       rm -f "${tmp_config}"
     fi
     copy_to_gpu_host "${CONFIG_OUT}" "/tmp/aks-flex-node-config.json"
-    prepare_flex_networking
     run_gpu_host_script 'set -euo pipefail
       curl -fsSL https://raw.githubusercontent.com/Azure/AKSFlexNode/main/scripts/install.sh | sudo bash -s -- --yes
       sudo install -d -m 0700 /etc/aks-flex-node
@@ -539,8 +436,6 @@ case "${COMMAND}" in
     '
     approve_flex_daemon_csrs
     ensure_flexnode_kube_proxy
-    prepare_flex_networking
-    verify_flex_networking
     kubectl get nodes -o wide
     ;;
   gpu-stack)
@@ -575,12 +470,8 @@ case "${COMMAND}" in
   reset)
     run_remote 'sudo aks-flex-node reset || sudo aks-flex-node unbootstrap || true; sudo nvidia-smi'
     ;;
-  network-fix)
-    prepare_flex_networking
-    verify_flex_networking
-    ;;
   *)
-    echo "Usage: $0 {join|gpu-stack|validate} {a|b} | $0 {reset|network-fix}" >&2
+    echo "Usage: $0 {join|gpu-stack|validate} {a|b} | $0 reset" >&2
     exit 1
     ;;
 esac
