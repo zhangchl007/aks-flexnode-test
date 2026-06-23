@@ -13,6 +13,7 @@ Do not commit generated FlexNode configs. `config-A.json` and `config-B.json` co
 - AKS Flex Node configuration guide: https://github.com/Azure/AKSFlexNode/blob/main/docs/usages/configuration.md
 - AKS Flex Config helper guide: https://github.com/Azure/AKSFlexNode/blob/main/docs/usages/aks-flex-config.md
 - GPU Flex Node lab: https://github.com/Azure/AKSFlexNode/blob/main/docs/labs/gpu-node-setup.md
+- AKS DRA with NVIDIA vGPU on AKS: https://github.com/Azure/AKS/blob/master/website/blog/2026-03-06-dra-with-vGPUs-on-aks/index.md
 
 ## Tested Environment
 
@@ -35,6 +36,19 @@ GPU host:
 - GPU: NVIDIA Tesla T4
 - Host image: `microsoft-dsvm:ubuntu-hpc:2204:latest`
 - Current tested final state: joined to cluster B, `Ready`, `nvidia.com/gpu=1`, CUDA VectorAdd `Test PASSED`
+
+A10 vGPU host validated later:
+
+- Hostname and Kubernetes node name: `aksflexgpu-a10-01`
+- Host resource group: `aksflex-a10-gpu-rg`
+- Host VM size: `Standard_NV36ads_A10_v5`
+- Region: `westus2`
+- Public IP: `52.233.95.129`
+- Private IP: `10.0.0.4`
+- GPU: NVIDIA A10 vGPU profile `NVIDIA A10-24Q`
+- Host image: `Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest`
+- Required driver: NVIDIA GRID `570.211.01`
+- Current tested final state: joined to cluster B, `Ready`, NVIDIA DRA driver running, `gpu.nvidia.com` ResourceSlice published, DRA CUDA VectorAdd `Test PASSED`
 
 ## Implementation Files
 
@@ -133,6 +147,432 @@ Cluster B notes:
 - Service VIP routing from inside `kube1` was verified with `curl -k https://10.200.0.1:443/version`, which returned the expected Kubernetes API `401 Unauthorized` response.
 - `kubectl logs` through the API server failed for the FlexNode because API-server-to-kubelet proxying to `10.0.0.4:10250` returned `500`. The workload still succeeded; logs were collected locally with `crictl` inside `kube1`.
 - The original managed system node in cluster B was `NotReady` during the final snapshot. That did not block the FlexNode GPU workload validation, but it should be tracked separately if cluster B is reused.
+
+### A10 vGPU DRA Validation On Cluster B
+
+The A10 validation followed the AKS DRA/vGPU guidance instead of the legacy `nvidia.com/gpu` path. Cluster B was required because it runs Kubernetes `1.34.8`; cluster A runs `1.33.10` and does not expose the DRA APIs (`deviceclasses`, `resourceslices`, `resourceclaims`).
+
+Final verified A10 state:
+
+- `aksflexgpu-a10-01` is `Ready` in `aksflex-gpu-test-b`.
+- Internal IP is `10.0.0.4`.
+- Kubelet version is `v1.34.8`.
+- Container runtime is `containerd://2.0.4`.
+- Driver on VM host is NVIDIA GRID `570.211.01`.
+- `nvidia-dra-driver-gpu-controller` is `1/1 Running` on the managed system node.
+- `nvidia-dra-driver-gpu-kubelet-plugin` is `2/2 Running` on `aksflexgpu-a10-01`.
+- `gpu.nvidia.com` and `compute-domain.nvidia.com` ResourceSlices exist for `aksflexgpu-a10-01`.
+- DRA CUDA VectorAdd completed on `aksflexgpu-a10-01` with `Test PASSED`.
+
+Implementation sequence that worked:
+
+1. Recreated the A10 VM with a clean Ubuntu image, not the Ubuntu HPC image, to avoid preinstalled NVIDIA package conflicts.
+2. Installed NVIDIA GRID `570.211.01` on the VM host. The `.run` installer must use the proprietary module path; do not use `-M open` for Azure A10 vGPU.
+3. Confirmed host GPU state with `nvidia-smi`, which reported `NVIDIA A10-24Q` and driver `570.211.01`.
+4. Repaired VNet peering between the A10 GPU VNet and cluster B's managed AKS VNet (`aks-vnet-15273631`). Both directions must be `Connected` and `FullyInSync`.
+5. Reconciled cluster B so it had a healthy managed system node (`syspoolv3`). The DRA controller needs a normal schedulable AKS node; it should not depend on the FlexNode.
+6. Removed stale legacy GPU Operator resources from cluster B. The DRA validation path should not run side-by-side with the legacy NVIDIA device plugin for the same GPU node.
+7. Installed NVIDIA DRA driver `25.8.1` with the AKS blog settings:
+
+   ```bash
+   helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+   helm repo update
+
+   helm upgrade --install nvidia-dra-driver-gpu nvidia/nvidia-dra-driver-gpu \
+     --version="25.8.1" \
+     --create-namespace \
+     --namespace nvidia-dra-driver-gpu \
+     --set "resources.gpus.enabled=true" \
+     --set "gpuResourcesEnabledOverride=true" \
+     --set "controller.nodeSelector=null" \
+     --set "controller.tolerations[0].key=CriticalAddonsOnly" \
+     --set "controller.tolerations[0].operator=Exists" \
+     --set "controller.affinity=null" \
+     --set "featureGates.IMEXDaemonsWithDNSNames=false" \
+     --set "nvidiaDriverRoot=/"
+   ```
+
+8. Joined the existing A10 VM to cluster B as a FlexNode with bootstrap-token auth. The host name changed from the older T4 `aksflexgpu01` to `aksflexgpu-a10-01`.
+9. Labeled the A10 node for the DRA plugin:
+
+   ```bash
+   kubectl label node aksflexgpu-a10-01 --overwrite nvidia.com/gpu.present=true
+   ```
+
+10. Copied `/usr/bin/nvidia-smi` from the VM host into `kube1` because AKS FlexNode does not automatically expose that binary inside the nspawn worker.
+11. Fixed NVIDIA library symlinks inside `kube1` so they resolve within the DRA driver's `/driver-root` mount. Absolute links such as `/run/host-nvidia/0/libnvidia-ml.so.1` are visible from the worker but resolve incorrectly from inside the DRA init container.
+12. Restarted the DRA kubelet plugin DaemonSet and confirmed it published ResourceSlices.
+
+Final validation commands:
+
+```bash
+kubectl get nodes -o wide
+kubectl -n nvidia-dra-driver-gpu get pods -o wide
+kubectl get deviceclasses
+kubectl get resourceslices -o wide
+```
+
+Expected DRA ResourceSlice output includes:
+
+```text
+aksflexgpu-a10-01-compute-domain.nvidia.com-...   aksflexgpu-a10-01   compute-domain.nvidia.com
+aksflexgpu-a10-01-gpu.nvidia.com-...              aksflexgpu-a10-01   gpu.nvidia.com
+```
+
+DRA VectorAdd smoke workload:
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: gpu-dra-smoke
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-dra-smoke
+spec:
+  restartPolicy: Never
+  resourceClaims:
+  - name: gpu
+    resourceClaimTemplateName: gpu-dra-smoke
+  containers:
+  - name: cuda-vectoradd
+    image: nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0-ubuntu22.04
+    resources:
+      claims:
+      - name: gpu
+```
+
+Expected result:
+
+```text
+[Vector addition of 50000 elements]
+CUDA kernel launch with 196 blocks of 256 threads
+Test PASSED
+Done
+```
+
+## A10 vGPU DRA Implementation Steps
+
+Use this sequence for the A10 vGPU / DRA path. It intentionally differs from the legacy `nvidia.com/gpu` GPU Operator flow.
+
+### 1. Start And Reconcile Cluster B
+
+Cluster B must be running and must have a healthy managed system node. The DRA controller should run on a regular AKS node, not on the FlexNode.
+
+```bash
+Confirm a managed system node is present:
+
+```bash
+az aks get-credentials \
+  -g aksflex-gpu-test-eastus2-rg \
+  -n aksflex-gpu-test-b \
+  --overwrite-existing
+
+kubectl get nodes -o wide
+```
+
+### 2. Confirm DRA APIs Exist
+
+The AKS DRA/vGPU blog requires Kubernetes `1.34+`.
+
+```bash
+kubectl api-resources | grep -E 'deviceclasses|resourceslices|resourceclaims'
+kubectl get deviceclasses
+kubectl get resourceslices
+```
+
+Expected before installing the NVIDIA DRA driver:
+
+```text
+No resources found
+```
+
+If the API server says it does not have `deviceclasses` or `resourceslices`, the cluster is not a valid DRA target.
+
+### 3. Install NVIDIA GRID Driver On The A10 VM
+
+The NVadsA10 v5 series is vGPU-based, not full GPU passthrough. Use the Microsoft-provided GRID driver package for Azure A10 vGPU. Do not use datacenter drivers and do not use the `.run` installer's `-M open` flag.
+
+```bash
+DRIVER_URL="https://download.microsoft.com/download/2a04ca6a-9eec-40d9-9564-9cdea1ab795f/NVIDIA-Linux-x86_64-570.211.01-grid-azure.run"
+DRIVER_FILE="/var/tmp/NVIDIA-Linux-x86_64-570.211.01-grid-azure.run"
+
+az vm run-command invoke \
+  -g aksflex-a10-gpu-rg \
+  -n aksflexgpu-a10-01 \
+  --command-id RunShellScript \
+  --scripts "bash -s <<'SCRIPT'
+set -euo pipefail
+DEBIAN_FRONTEND=noninteractive apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates build-essential linux-headers-\$(uname -r)
+curl -fSL --cacert /etc/ssl/certs/ca-certificates.crt -o '${DRIVER_FILE}' '${DRIVER_URL}'
+chmod +x '${DRIVER_FILE}'
+'${DRIVER_FILE}' --silent --no-questions
+nvidia-smi
+SCRIPT"
+```
+
+Expected result:
+
+```text
+NVIDIA-SMI 570.211.01
+Driver Version: 570.211.01
+GPU: NVIDIA A10-24Q
+```
+
+### 4. Reset And Join The Existing A10 VM To Cluster B
+
+Do not delete the VM. Reset the FlexNode runtime, remove stale node objects, then join cluster B.
+
+```bash
+./flexnode.sh reset
+
+az aks get-credentials \
+  -g aks-test-rg \
+  -n aks-storage-test \
+  --overwrite-existing
+kubectl delete node aksflexgpu-a10-01 --ignore-not-found
+
+az aks get-credentials \
+  -g aksflex-gpu-test-eastus2-rg \
+  -n aksflex-gpu-test-b \
+  --overwrite-existing
+./flexnode.sh join b
+```
+
+If SSH from the command runner cannot reach port 22, `flexnode.sh` falls back to Azure VM Run Command. Run Command scripts must be explicitly wrapped in Bash when they contain Bash-only syntax such as `set -euo pipefail`.
+
+Expected result:
+
+```text
+aksflexgpu-a10-01   Ready   v1.34.8   10.0.0.4
+
+### 6. Install NVIDIA DRA Driver
+
+Use the settings from the AKS DRA/vGPU blog. Keep IMEX DNS names disabled for this A10 vGPU validation.
+
+```bash
+helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+helm repo update
+
+helm upgrade --install nvidia-dra-driver-gpu nvidia/nvidia-dra-driver-gpu \
+  --version="25.8.1" \
+  --create-namespace \
+  --namespace nvidia-dra-driver-gpu \
+  --set "resources.gpus.enabled=true" \
+  --set "gpuResourcesEnabledOverride=true" \
+  --set "controller.nodeSelector=null" \
+  --set "controller.tolerations[0].key=CriticalAddonsOnly" \
+  --set "controller.tolerations[0].operator=Exists" \
+  --set "controller.affinity=null" \
+  --set "featureGates.IMEXDaemonsWithDNSNames=false" \
+  --set "nvidiaDriverRoot=/"
+```
+
+Label the FlexNode for the DRA kubelet plugin if needed:
+
+```bash
+kubectl label node aksflexgpu-a10-01 nvidia.com/gpu.present=true --overwrite
+```
+
+### 7. Prepare Driver Files Inside `kube1` For DRA
+
+AKS FlexNode exposes the host driver into `kube1`, but the DRA driver validates the mounted driver root. The final working setup used:
+
+- `/usr/bin/nvidia-smi` present inside `kube1`
+- NVIDIA libraries available under `/run/host-nvidia/0`
+- Relative symlinks from standard library paths to `/run/host-nvidia/0`
+- Helm value `nvidiaDriverRoot=/`
+
+Copy `nvidia-smi` from the VM host into `kube1`:
+
+```bash
+az vm run-command invoke \
+  -g aksflex-a10-gpu-rg \
+  -n aksflexgpu-a10-01 \
+  --command-id RunShellScript \
+  --scripts "bash -s <<'SCRIPT'
+set -euo pipefail
+machinectl copy-to kube1 /usr/bin/nvidia-smi /usr/bin/nvidia-smi
+machinectl shell kube1 /bin/bash -lc 'set -euo pipefail
+  /usr/bin/nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+'
+SCRIPT"
+```
+
+Create the relative library symlinks from a privileged debug pod on the FlexNode:
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: a10-host-inspect
+spec:
+  nodeName: aksflexgpu-a10-01
+  hostPID: true
+  restartPolicy: Never
+  tolerations:
+  - operator: Exists
+  containers:
+  - name: shell
+    image: ubuntu:22.04
+    command: ["/bin/bash", "-lc", "sleep 3600"]
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: host-root
+      mountPath: /host
+  volumes:
+  - name: host-root
+    hostPath:
+      path: /
+      type: Directory
+EOF
+
+kubectl wait --for=condition=Ready pod/a10-host-inspect --timeout=3m
+
+kubectl exec a10-host-inspect -- bash -lc 'set -euo pipefail
+ln -sf ../../../run/host-nvidia/0/libcuda.so.570.211.01 /host/usr/lib/x86_64-linux-gnu/libcuda.so.570.211.01
+ln -sf libcuda.so.570.211.01 /host/usr/lib/x86_64-linux-gnu/libcuda.so.1
+ln -sf libcuda.so.1 /host/usr/lib/x86_64-linux-gnu/libcuda.so
+ln -sf ../../../run/host-nvidia/0/libnvidia-ml.so.570.211.01 /host/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.570.211.01
+ln -sf libnvidia-ml.so.570.211.01 /host/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+ln -sf libnvidia-ml.so.1 /host/usr/lib/x86_64-linux-gnu/libnvidia-ml.so
+ln -sf ../run/host-nvidia/0/libcuda.so.570.211.01 /host/usr/lib64/libcuda.so.570.211.01
+ln -sf libcuda.so.570.211.01 /host/usr/lib64/libcuda.so.1
+ln -sf libcuda.so.1 /host/usr/lib64/libcuda.so
+ln -sf ../run/host-nvidia/0/libnvidia-ml.so.570.211.01 /host/usr/lib64/libnvidia-ml.so.570.211.01
+ln -sf libnvidia-ml.so.570.211.01 /host/usr/lib64/libnvidia-ml.so.1
+ln -sf libnvidia-ml.so.1 /host/usr/lib64/libnvidia-ml.so
+'
+```
+
+Restart and validate the DRA plugin:
+
+```bash
+kubectl -n nvidia-dra-driver-gpu rollout restart ds/nvidia-dra-driver-gpu-kubelet-plugin
+kubectl -n nvidia-dra-driver-gpu rollout status ds/nvidia-dra-driver-gpu-kubelet-plugin --timeout=5m
+kubectl -n nvidia-dra-driver-gpu get pods -o wide
+kubectl get resourceslices -o wide
+```
+
+Expected result:
+
+```text
+nvidia-dra-driver-gpu-kubelet-plugin   2/2   Running
+aksflexgpu-a10-01-gpu.nvidia.com-...   aksflexgpu-a10-01   gpu.nvidia.com
+```
+
+### 8. Validate A DRA GPU Workload
+
+Use `ResourceClaimTemplate` and `resources.claims`, not `nvidia.com/gpu` limits.
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: gpu-dra-smoke
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.nvidia.com
+          count: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-dra-smoke
+spec:
+  restartPolicy: Never
+  resourceClaims:
+  - name: gpu
+    resourceClaimTemplateName: gpu-dra-smoke
+  containers:
+  - name: cuda-vectoradd
+    image: nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0-ubuntu22.04
+    resources:
+      claims:
+      - name: gpu
+EOF
+
+kubectl wait --for=condition=PodScheduled pod/gpu-dra-smoke --timeout=5m
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/gpu-dra-smoke --timeout=10m
+kubectl get pod gpu-dra-smoke -o wide
+kubectl logs gpu-dra-smoke
+```
+
+Expected result:
+
+```text
+[Vector addition of 50000 elements]
+CUDA kernel launch with 196 blocks of 256 threads
+Test PASSED
+Done
+```
+
+Clean up:
+
+```bash
+kubectl delete pod gpu-dra-smoke --ignore-not-found
+kubectl delete resourceclaimtemplate gpu-dra-smoke --ignore-not-found
+kubectl delete pod a10-host-inspect --ignore-not-found --wait=false
+```
+
+## A10 Notes And Lessons Learned
+
+### Driver And Image Lessons
+
+- Azure `Standard_NV*ads_A10_v5` uses NVIDIA vGPU, not ordinary PCI passthrough. Treat it as a GRID/vGPU host from the start.
+- The working A10 driver was NVIDIA GRID `570.211.01`. The VM reported `NVIDIA A10-24Q` in `nvidia-smi`.
+- The Ubuntu HPC image caused driver conflicts because it had preinstalled NVIDIA packages. Use a clean Canonical Ubuntu image and install the required GRID driver explicitly.
+- Do not use the NVIDIA `.run` installer's `-M open` flag for this A10 vGPU case. The open kernel module path is not the working path for Azure vGPU.
+- Download driver installers into `/var/tmp`, not `/tmp`, because `/tmp` may be cleared across reboot or recovery steps.
+
+### Cluster And Network Lessons
+
+- The AKS DRA/vGPU blog requires Kubernetes `1.34+`. Cluster A (`1.33.10`) cannot use that DRA path because it does not serve `deviceclasses` or `resourceslices`.
+- Cluster B must have a healthy managed system node before installing DRA. The DRA controller should schedule on a regular AKS node; it should not depend on the FlexNode.
+- A stopped or failed cluster B can show stale FlexNode state. Reconcile the AKS cluster and ensure the system node pool is healthy before debugging DRA.
+- Bidirectional VNet peering must exist between the GPU VM VNet and the target AKS VNet. A one-sided or stale `Disconnected` peering does not program the expected routes.
+- Validate peering from Azure, not by assumption:
+
+  ```bash
+  az network vnet peering list -g <rg> --vnet-name <vnet> -o table
+  az network nic show-effective-route-table --ids <gpu-nic-id> -o table
+  ```
+
+### DRA And GPU Stack Lessons
+
+- Do not mix the legacy GPU Operator/device-plugin path with the DRA path for the same validation. Remove stale `gpu-operator` resources before relying on DRA.
+- The DRA kubelet plugin requires the node label `nvidia.com/gpu.present=true`; otherwise the DaemonSet may not schedule.
+- The DRA plugin prestart check must find both `nvidia-smi` and `libnvidia-ml.so.1` inside the configured `nvidiaDriverRoot`.
+- For AKS FlexNode, the working DRA driver root was `/` after copying `/usr/bin/nvidia-smi` into `kube1`.
+- The NVIDIA libraries were exposed under `/run/host-nvidia/0`, but absolute symlinks from `/usr/lib/x86_64-linux-gnu` to `/run/host-nvidia/0/...` were broken from inside the DRA container's `/driver-root` view. Relative symlinks resolved correctly.
+- When the DRA plugin init logs say `libnvidia-ml.so.1: not found`, exec into the init container and inspect `/driver-root` directly. The worker rootfs view and the plugin's mounted driver-root view are not always equivalent.
+- DRA validation workloads must use `ResourceClaimTemplate` and `resources.claims`; they should not request `nvidia.com/gpu: 1`.
+
+### Operational Lessons
+
+- Keep old T4 and new A10 hostnames separate. The old node was `aksflexgpu01`; the A10 node is `aksflexgpu-a10-01`.
+- Delete stale Kubernetes `Node` objects after host reset or cluster movement. Host reset does not automatically remove node objects from the source cluster.
+- Only approve CSRs tied to the active bootstrap token. Do not bulk approve old pending CSRs.
+- Keep generated `config-A.json` and `config-B.json` out of commits because they contain bootstrap material.
+- Capture final evidence every time: node readiness, DRA pods, `DeviceClass`, `ResourceSlice`, and smoke workload logs.
 
 ## Detailed Remove And Rejoin Steps
 
@@ -276,6 +716,9 @@ The script performs these actions:
    toolkit.enabled=false
    hostPaths.driverInstallDir=/run/nvidia/driver
    ```
+
+  The `driver.enabled=false` setting is mandatory here because the GPU host image
+  must already include a working NVIDIA driver.
 
 Expected result:
 

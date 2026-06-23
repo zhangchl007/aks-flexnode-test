@@ -73,7 +73,9 @@ run_gpu_host_script() {
   fi
   if [[ -n "${GPU_RG:-}" && -n "${GPU_VM_NAME:-}" ]]; then
     echo "SSH to ${TARGET_HOST} failed; falling back to Azure VM Run Command for ${GPU_RG}/${GPU_VM_NAME}." >&2
-    if run_az_vm_command "${script}"; then
+    if run_az_vm_command "bash -s <<'AZ_RUN_SCRIPT'
+${script}
+AZ_RUN_SCRIPT"; then
       return 0
     fi
     echo "Azure VM Run Command failed or timed out after ${AZ_VM_RUN_COMMAND_TIMEOUT:-10m}." >&2
@@ -117,7 +119,19 @@ ensure_helper() {
 }
 
 ensure_kubeconfig() {
-  az aks get-credentials --resource-group "${CLUSTER_RG}" --name "${CLUSTER_NAME}" --overwrite-existing >/dev/null
+  local disable_local_accounts
+  disable_local_accounts="$(az aks show --resource-group "${CLUSTER_RG}" --name "${CLUSTER_NAME}" --query disableLocalAccounts -o tsv 2>/dev/null || true)"
+
+  if [[ "${disable_local_accounts}" == "true" ]]; then
+    az aks get-credentials --resource-group "${CLUSTER_RG}" --name "${CLUSTER_NAME}" --overwrite-existing >/dev/null
+    return 0
+  fi
+
+  if az aks get-credentials --resource-group "${CLUSTER_RG}" --name "${CLUSTER_NAME}" --overwrite-existing >/dev/null 2>&1; then
+    return 0
+  fi
+
+  az aks get-credentials --admin --resource-group "${CLUSTER_RG}" --name "${CLUSTER_NAME}" --overwrite-existing >/dev/null
 }
 
 prepare_gpu_host_runtime() {
@@ -468,7 +482,7 @@ case "${COMMAND}" in
     kubectl delete pod gpu-smoke --ignore-not-found
     ;;
   reset)
-    run_remote 'sudo aks-flex-node reset || sudo aks-flex-node unbootstrap || true; sudo nvidia-smi'
+    run_gpu_host_script 'sudo aks-flex-node reset || sudo aks-flex-node unbootstrap || true; sudo nvidia-smi'
     ;;
   *)
     echo "Usage: $0 {join|gpu-stack|validate} {a|b} | $0 reset" >&2
